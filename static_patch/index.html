@@ -2102,18 +2102,19 @@
         width: 24px;
         height: 24px;
         border-radius: 50%;
-        background: #f62c55;
+        background: rgba(246, 44, 85, 0.85);
         color: #ffffff;
         display: flex;
         align-items: center;
         justify-content: center;
         font-size: 11px;
         cursor: pointer;
-        transition: transform 0.15s ease;
+        transition: transform 0.15s ease, background 0.15s ease;
         flex-shrink: 0;
         box-shadow: 0 2px 6px rgba(246, 44, 85, 0.4);
     }
     .fn-lx-play-btn:hover {
+        background: #f62c55;
         transform: scale(1.1);
     }
     #fnmusic-toast-bubble {
@@ -2164,6 +2165,69 @@
             toast.classList.remove("show");
             setTimeout(function() { toast.style.display = "none"; }, 250);
         }, 2200);
+    };
+
+    window.fnGoToTrackSearch = function(song) {
+        if (!song) return;
+        var title = (song.title || "").trim();
+        var artist = (song.artist || "").trim();
+        var targetQuery = title;
+        if (artist && artist !== "群星" && artist !== "华语群星" && artist !== "未知歌手" && artist !== "推荐" && artist !== "本地曲库") {
+            targetQuery = title + " - " + artist;
+        }
+
+        hidePanel();
+
+        // 1. 设置输入框文本并派发事件同步 React 受控状态
+        if (activeInput) {
+            try {
+                var nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                if (nativeSetter) {
+                    nativeSetter.call(activeInput, targetQuery);
+                } else {
+                    activeInput.value = targetQuery;
+                }
+                activeInput.dispatchEvent(new Event("input", { bubbles: true }));
+                activeInput.dispatchEvent(new Event("change", { bubbles: true }));
+            } catch(e) {
+                activeInput.value = targetQuery;
+            }
+        }
+
+        // 2. 路由跳转到搜索列表页，同时展示该音乐及作者其他作品
+        var routed = false;
+        if (window.__FN_ROUTER__ && typeof window.__FN_ROUTER__.navigate === "function") {
+            try {
+                window.__FN_ROUTER__.navigate({
+                    to: "/search",
+                    search: { q: targetQuery, tab: "track" },
+                    replace: false
+                });
+                routed = true;
+            } catch(e) {
+                console.warn("[fnmusic] __FN_ROUTER__.navigate to /search failed:", e);
+            }
+        }
+
+        if (!routed && window.fnNavigate) {
+            try {
+                window.fnNavigate("/search?q=" + encodeURIComponent(targetQuery) + "&tab=track");
+                routed = true;
+            } catch(e) {}
+        }
+
+        if (!routed) {
+            try {
+                window.location.href = "/music/search?q=" + encodeURIComponent(targetQuery) + "&tab=track";
+            } catch(e) {}
+        }
+
+        // 3. 静默通知 QueryClient 失效，保证立即拉取全新聚合搜索结果
+        if (window.invalidateFnQueries) {
+            setTimeout(function() {
+                try { window.invalidateFnQueries(); } catch(e) {}
+            }, 60);
+        }
     };
 
     window.fnPlayCandidate = function(song) {
@@ -2259,7 +2323,7 @@
         }
 
         var searchSvg = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>';
-        var playSvg = '<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
+        var viewSvg = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="9 18 15 12 9 6"></polyline></svg>';
 
         var html = "";
         itemsData.forEach(function(item, idx) {
@@ -2276,7 +2340,7 @@
                     badge +
                     '  </div>' +
                     '  <div class="fn-lx-suggest-actions">' +
-                    '    <div class="fn-lx-play-btn" data-action="play" data-idx="' + idx + '" title="立即播放">' + playSvg + '</div>' +
+                    '    <div class="fn-lx-play-btn" data-action="view" data-idx="' + idx + '" title="查看单曲及该作者作品">' + viewSvg + '</div>' +
                     '  </div>' +
                     '</div>';
         });
@@ -2293,11 +2357,10 @@
             var idx = parseInt(itemEl.getAttribute("data-idx"), 10);
             if (isNaN(idx) || !itemsData[idx]) return;
 
-            var playBtn = e.target.closest(".fn-lx-play-btn");
             var item = itemsData[idx];
 
-            // 无论点击播放按钮还是点击该行，均可便捷起播；若按需要也可填入搜索词
-            window.fnPlayCandidate(item);
+            // 点击推荐搜索结果时不要直接播放，跳转到该音乐并以列表展示，同时展示该作者的其他音乐
+            window.fnGoToTrackSearch(item);
         };
     }
 
@@ -2377,7 +2440,7 @@
         } else if (e.key === "Enter" && activeIdx >= 0) {
             e.preventDefault();
             if (itemsData[activeIdx]) {
-                window.fnPlayCandidate(itemsData[activeIdx]);
+                window.fnGoToTrackSearch(itemsData[activeIdx]);
             }
         } else if (e.key === "Escape") {
             hidePanel();

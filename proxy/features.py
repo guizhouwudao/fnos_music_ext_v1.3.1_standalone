@@ -13,6 +13,9 @@ import asyncio
 import hashlib
 import json
 import logging
+
+LX_AUTH_HEADER = {"User-Agent": "Mozilla/5.0"}
+
 import os
 import re
 import shutil
@@ -752,26 +755,42 @@ async def download_online_song(
                 except Exception:
                     pass
 
-            # 若落雪源无法获取直链，自动使用网易云音乐 API 进行故障转移解析
+            # 若落雪源未导入/已停用/无法获取直链，自动无缝接入网易云音乐 API 进行解析与下载
             if not stream_url:
-                logger.info("落雪源直链不可用，启动网易云音乐 API 故障转移下载: %s - %s", title, artist)
+                logger.info("未导入或停用落雪源，无缝接入网易云音乐 API 下载: %s - %s", title, artist)
                 try:
                     import netease_api
-                    wy_res = await netease_api.netease_client.resolve_failover_track(
-                        song_id=raw_id,
-                        title=title,
-                        artist=artist
-                    )
-                    if wy_res.get("ok") and wy_res.get("url"):
-                        stream_url = wy_res["url"]
-                        ext = wy_res.get("ext") or "flac"
-                        download_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-                        if wy_res.get("pic_url"):
-                            cover_pic_url = wy_res["pic_url"]
-                        if wy_res.get("lyric") and not lrc_text.strip():
-                            lrc_text = wy_res["lyric"]
-                        if wy_res.get("album") and not album:
-                            album = wy_res["album"]
+                    # 若直接包含网易云纯数字 ID，直接调用 get_song_url
+                    clean_sid = raw_id
+                    if clean_sid.startswith("lx:"):
+                        clean_sid = clean_sid[len("lx:"):]
+                    if clean_sid.startswith("wy:"):
+                        clean_sid = clean_sid[len("wy:"):]
+                    
+                    if clean_sid.isdigit() and len(clean_sid) >= 4:
+                        n_cfg = netease_api.load_netease_config()
+                        u_res = await netease_api.netease_client.get_song_url(clean_sid, level=n_cfg.get("quality", "lossless"), cookie=n_cfg.get("cookie", ""))
+                        if u_res.get("ok") and u_res.get("url"):
+                            stream_url = u_res["url"]
+                            ext = u_res.get("type") or "flac"
+                            download_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+                    if not stream_url:
+                        wy_res = await netease_api.netease_client.resolve_failover_track(
+                            song_id=raw_id,
+                            title=title,
+                            artist=artist
+                        )
+                        if wy_res.get("ok") and wy_res.get("url"):
+                            stream_url = wy_res["url"]
+                            ext = wy_res.get("ext") or "flac"
+                            download_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+                            if wy_res.get("pic_url"):
+                                cover_pic_url = wy_res["pic_url"]
+                            if wy_res.get("lyric") and not lrc_text.strip():
+                                lrc_text = wy_res["lyric"]
+                            if wy_res.get("album") and not album:
+                                album = wy_res["album"]
                 except Exception as e_wy:
                     logger.warning("netease download failover failed: %s", e_wy)
 

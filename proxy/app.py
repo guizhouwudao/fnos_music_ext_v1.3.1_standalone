@@ -256,14 +256,14 @@ def is_playable_online_track(item: dict, require_id: bool = False) -> bool:
     if item.get("has_stream") is False:
         return False
 
-    # 5. 音频流直链校验：若带有 download_url 或 url 键，则必须合法可用，绝不能是空串或 404
-    if "download_url" in item:
-        d_url = str(item.get("download_url") or "").strip()
-        if not d_url or not d_url.startswith(("http://", "https://")) or "404/error.html" in d_url or "error.html" in d_url:
+    # 5. 音频流直链校验：若带有显式非空的 download_url 或 url 键，则校验必须合法
+    if item.get("download_url"):
+        d_url = str(item.get("download_url")).strip()
+        if not d_url.startswith(("http://", "https://")) or "404/error.html" in d_url or "error.html" in d_url:
             return False
-    if "url" in item:
-        u = str(item.get("url") or "").strip()
-        if not u or "404/error.html" in u or "error.html" in u:
+    if item.get("url"):
+        u = str(item.get("url")).strip()
+        if not u.startswith(("http://", "https://")) or "404/error.html" in u or "error.html" in u:
             return False
 
     # 6. 片段时长校验（<=35s 且带有试听迹象）
@@ -291,37 +291,176 @@ def _same_recording(left: dict, right: dict) -> bool:
         return False
 
 
+def parse_search_intent(kw: str) -> tuple[str, str]:
+    """解析搜索词中的单曲名与作者名：返回 (target_song, target_artist)"""
+    kw = (kw or "").strip()
+    if not kw:
+        return "", ""
+    for sep in [" - ", " / ", "-", "/"]:
+        if sep in kw:
+            parts = kw.split(sep, 1)
+            p1, p2 = parts[0].strip(), parts[1].strip()
+            if p1 and p2:
+                return p1, p2
+    parts = kw.split()
+    if len(parts) >= 2:
+        return parts[0].strip(), parts[1].strip()
+    return "", ""
+
+
+def score_online_item(it: dict, kw: str, top_artist: str = "") -> float:
+    """智能搜索打分算法：
+    1. 单曲+作者模式（类似网易云单曲搜索）：
+       - 目标单曲（精确匹配目标歌名与作者）：排在第 1 位 (1000+ 分)
+       - 该作者的其他音乐作品：紧随其后以列表形式完整展示 (600+ 分)
+       - 随后展示其他版本与相关作品 (< 250 分)
+    2. 搜索纯歌手名：优先展示其录音室正式专辑、原唱代表作，其次展示合作作品、Live版，最后展示翻唱、DJ、伴奏；
+    3. 搜索歌名：优先展示原唱（完全匹配、无杂质后缀、原唱歌手），其次展示正规 Live/新版，然后展示翻唱，最后展示 DJ/3D/伴奏。
+    """
+    title = str(it.get("title") or it.get("name") or "").strip()
+    artist = str(it.get("artist") or "").strip()
+    album = str(it.get("album") or "").strip()
+
+    t_lower = title.lower()
+    a_lower = artist.lower()
+    al_lower = album.lower()
+    kw_lower = kw.strip().lower()
+    kw_words = [w for w in kw_lower.split() if w]
+
+    score = 0.0
+
+    # 1. 垃圾/低质过滤权重 (严重减分)
+    if any(tag in t_lower for tag in ["伴奏", "instrumental", "karaoke"]):
+        score -= 600
+    if any(tag in t_lower for tag in ["片段", "15秒", "铃声", "高潮", "抖音版"]):
+        score -= 400
+    if any(tag in t_lower for tag in ["dj", "3d环绕", "慢摇", "电音", "串烧", "remix"]):
+        score -= 200
+    if any(tag in t_lower for tag in ["cover", "翻唱", "翻自"]):
+        score -= 100
+    if any(tag in a_lower for tag in ["翻唱", "cover", "纯音乐"]):
+        score -= 80
+
+    # 2. 搜索模式识别与核心加权
+    # 2.0 模式 A：单曲 + 作者模式 (如用户点击推荐或输入 "一剪梅 (粤语版) - 林北北" / "一剪梅 林北北")
+    p1, p2 = parse_search_intent(kw)
+    if p1 and p2:
+        p1_l, p2_l = p1.lower(), p2.lower()
+        # 目标单曲：双向匹配歌名与歌手
+        is_target_song = (
+            (p1_l in t_lower and p2_l in a_lower) or
+            (p2_l in t_lower and p1_l in a_lower)
+        )
+        if is_target_song:
+            score += 1000.0
+            clean_t = re.sub(r"[\(\[\{（【].*?[\)\]\}）】]", "", t_lower).strip()
+            clean_p1 = re.sub(r"[\(\[\{（【].*?[\)\]\}）】]", "", p1_l).strip()
+            clean_p2 = re.sub(r"[\(\[\{（【].*?[\)\]\}）】]", "", p2_l).strip()
+            if clean_t in (clean_p1, clean_p2):
+                score += 150.0
+            if album and album not in ("精选专辑", "华语流行", "未知专辑"):
+                score += 50.0
+            return score
+
+        # 该作者的其他音乐作品：歌手名包含 p1 或 p2
+        is_author_other_work = (p1_l in a_lower or p2_l in a_lower)
+        if is_author_other_work:
+            score += 600.0
+            if album and not any(k in al_lower for k in ["精选", "合辑", "翻唱", "dj"]):
+                score += 80.0
+            if not any(k in t_lower for k in ["cover", "翻唱", "伴奏", "dj", "慢摇", "片段"]):
+                score += 100.0
+            else:
+                score -= 100.0
+            return score
+
+        # 仅歌名匹配的翻唱版本
+        if p1_l in t_lower or p2_l in t_lower:
+            score += 200.0
+            return score
+
+    # 2.1 模式 B：用户搜索纯歌手 (如 "周杰伦" 或 "林北北")
+    if kw_words and len(kw_words) == 1 and kw_lower in a_lower and kw_lower not in t_lower:
+        if a_lower == kw_lower:
+            score += 500  # 绝对独唱原唱作品
+        else:
+            score += 350  # 包含该歌手的合作作品
+        # 原版录音室专辑作品加分
+        if not any(k in t_lower for k in ["live", "现场"]):
+            score += 80
+        else:
+            score += 30
+        if album and not any(k in al_lower for k in ["精选", "合辑", "翻唱", "dj"]):
+            score += 50
+    else:
+        # 2.2 模式 C：用户搜索歌名 (如 "站在草原望北京")
+        clean_title = re.sub(r"[\(\[\{（【].*?[\)\]\}）】]", "", t_lower).strip()
+        if kw_lower == clean_title:
+            if t_lower == clean_title:
+                score += 500  # 最纯正原版单曲
+            else:
+                if any(k in t_lower for k in ["live", "现场", "乘风", "我是歌手"]):
+                    score += 350  # 官方高品质现场
+                elif any(k in t_lower for k in ["新版", "合唱", "重唱"]):
+                    score += 320
+                else:
+                    score += 250
+        elif kw_lower in t_lower:
+            score += 150
+        elif any(w in t_lower for w in kw_words if w):
+            score += 60
+        else:
+            score -= 100  # 歌名完全不包含搜索词时降级
+
+        # 专辑主打歌加分
+        if kw_lower in al_lower:
+            score += 80
+
+        # 原唱歌手强力加权
+        if top_artist and top_artist.lower() in a_lower:
+            score += 200
+
+    # 时长完整性加分
+    dur = float(it.get("duration_s") or 0)
+    if dur >= 150:
+        score += 30
+    elif 0 < dur < 60:
+        score -= 100
+
+    # 无损音质与封面加分
+    ext = str(it.get("ext") or "").lower()
+    size = int(it.get("file_size") or 0)
+    if ext in ("flac", "wav", "ape") or size >= 10 * 1024 * 1024:
+        score += 20
+    if bool(it.get("cover_url")):
+        score += 10
+
+    return score
+
+
 def deduplicate_online_items(items: list[dict], keyword: str = "") -> list[dict]:
-    """Keep the published representative and strict recording alternatives, prioritizing relevance, lossless and rich metadata."""
+    """保留丰富多版本资源（原唱、正式专辑、Live、翻唱等），按原唱与代表作智能打分排序。"""
     result: list[dict] = []
     seen = set()
 
+    # 统计出现频次最高的歌手作为主要原唱参考
+    from collections import Counter
+    artist_counts = Counter()
     kw_clean = (keyword or "").strip().lower()
+    for it in items:
+        t = re.sub(r"[\(\[\{（【].*?[\)\]\}）】]", "", str(it.get("title") or "").strip()).lower()
+        if kw_clean == t:
+            for a in it.get("artist", "").replace("&", "/").split("/"):
+                a_str = a.strip()
+                if a_str and "cover" not in a_str.lower() and "翻唱" not in a_str and a_str != "华语群星":
+                    artist_counts[a_str] += 1
+    top_artist = artist_counts.most_common(1)[0][0] if artist_counts else ""
 
-    # 排序：关键词匹配度（完全包含 > 部分包含） > 无损格式(flac/wav/ape/10MB+) > 有封面 > 文件大小
-    def _rank_item(it: dict) -> tuple:
-        title = str(it.get("title") or it.get("name") or "").strip().lower()
-        artist = str(it.get("artist") or "").strip().lower()
-        match_score = 0
-        if kw_clean:
-            if kw_clean == title:
-                match_score = 4
-            elif kw_clean in title:
-                match_score = 3
-            elif kw_clean in artist:
-                match_score = 2
-            elif any(part in title for part in kw_clean.split() if part):
-                match_score = 1
-            else:
-                match_score = -1  # 与关键词无关的条目降级
-        ext = str(it.get("ext") or "").lower()
-        size = int(it.get("file_size") or 0)
-        is_lossless = 1 if ext in ("flac", "wav", "ape") or size >= 10 * 1024 * 1024 else 0
-        has_cover = 1 if bool(it.get("cover_url")) else 0
-        return (match_score, is_lossless, has_cover, size)
+    # 执行智能打分排序
+    sorted_items = sorted(items, key=lambda x: score_online_item(x, kw_clean, top_artist=top_artist), reverse=True)
 
-    sorted_items = sorted(items, key=_rank_item, reverse=True)
-
+    # 宽松去重：仅去重完全相同 GUID，或标题、歌手、专辑完全一致的重复录音，保留不同版本
+    seen_signatures = set()
     for item in sorted_items:
         if not is_playable_online_track(item):
             continue
@@ -329,15 +468,17 @@ def deduplicate_online_items(items: list[dict], keyword: str = "") -> list[dict]
         if guid in seen:
             continue
         seen.add(guid)
-        representative = next((x for x in result if _same_recording(x, item)), None)
-        if representative is None:
-            representative = dict(item)
-            representative["_alternatives"] = list(item.get("_alternatives", []))
-            result.append(representative)
-        else:
-            alternatives = representative.setdefault("_alternatives", [])
-            if guid not in {online_guid_from_item(x) for x in alternatives}:
-                alternatives.append({k: v for k, v in item.items() if k != "_alternatives"})
+
+        t_c = str(item.get("title") or "").strip().lower()
+        a_c = str(item.get("artist") or "").strip().lower()
+        al_c = str(item.get("album") or "").strip().lower()
+        sig = (t_c, a_c, al_c)
+        if sig in seen_signatures:
+            continue
+        seen_signatures.add(sig)
+
+        result.append(dict(item))
+
     return result
 
 
@@ -408,6 +549,20 @@ def song_id_from_online_guid(guid: str) -> str:
 
 def is_online_guid(guid: str) -> bool:
     return bool(guid) and guid.startswith("online:")
+
+
+def is_download_guid(guid: str) -> bool:
+    return bool(guid) and guid.startswith("download:")
+
+
+def download_id_from_guid(guid: str) -> int | None:
+    if not is_download_guid(guid):
+        return None
+    try:
+        parts = guid.split(":")
+        return int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else None
+    except Exception:
+        return None
 
 
 def source_from_online_guid(guid: str) -> str:
@@ -1428,20 +1583,41 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, track_info: di
         except Exception as e:
             logger.warning("resolve_lx_url error for %s (quality=%s): %s", song_id, q, e)
 
-    # 3. 故障转移至网易云音乐 API 直链解析 (当落雪源无法解析或已全部关闭时)
+    # 3. 故障转移至网易云音乐 API / 酷我 API 直链解析 (当未导入落雪源或落雪源全部停用时，无缝直连)
     try:
         t_name = (track_info or {}).get("title") or (track_info or {}).get("name") or (cached_info or {}).get("title") or (cached_info or {}).get("name") or ""
         t_artist = (track_info or {}).get("artist") or (track_info or {}).get("singer") or (cached_info or {}).get("artist") or (cached_info or {}).get("singer") or ""
-        if not t_name:
-            try:
-                r_inf = await client.get("/api/v1/track/info", params={"id": song_id}, timeout=1.5)
-                if r_inf.status_code == 200:
-                    d_inf = (r_inf.json() or {}).get("data") or {}
-                    t_name = d_inf.get("title") or d_inf.get("name") or ""
-                    t_artist = d_inf.get("artist") or d_inf.get("singer") or ""
-            except Exception:
-                pass
+        
+        # 3.1 尝试从 song_id 中提取真实信息
+        clean_sid = song_id
+        if clean_sid.startswith("online:"):
+            clean_sid = clean_sid[len("online:"):]
+        if clean_sid.startswith("lx:"):
+            clean_sid = clean_sid[len("lx:"):]
+        sub_src = "wy"
+        sub_id = clean_sid
+        if ":" in clean_sid:
+            parts = clean_sid.split(":")
+            sub_src = parts[0]
+            sub_id = ":".join(parts[1:])
 
+        # 3.2 若为网易云 ID 且没有歌名，优先通过网易云 API 精确获取直链
+        if sub_src == "wy" and sub_id.isdigit():
+            n_cfg = netease_api.load_netease_config()
+            target_q = n_cfg.get("quality", "lossless")
+            u_res = await netease_api.netease_client.get_song_url(sub_id, level=target_q, cookie=n_cfg.get("cookie", ""))
+            if u_res.get("ok") and u_res.get("url"):
+                res = {
+                    "url": u_res["url"],
+                    "ext": u_res.get("type", "flac"),
+                    "actual_tier": u_res.get("level", "lossless"),
+                    "file_size": u_res.get("size", 31457280),
+                    "source": "网易云音乐 (原生直连)",
+                }
+                _RESOLVE_CACHE[song_id] = (now, res)
+                return res
+
+        # 3.3 通过曲名与歌手进行网易云智能检索与故障转移解析
         failover_res = await netease_api.netease_client.resolve_failover_track(
             song_id=song_id,
             title=t_name,
@@ -1453,7 +1629,7 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str, track_info: di
                 "ext": failover_res.get("ext", "flac"),
                 "actual_tier": failover_res.get("quality", "lossless"),
                 "file_size": failover_res.get("size", 31457280),
-                "source": "网易云音乐 (VIP故障转移)"
+                "source": "网易云音乐 (无缝直连)"
             }
             _RESOLVE_CACHE[song_id] = (now, res)
             logger.info(f"resolve_lx_url failover to NetEase API for {song_id} ({t_name} - {t_artist}) success!")
@@ -1954,8 +2130,19 @@ async def search_track(request: Request):
                 album_name = str(item["album"].get("name") or "").strip().lower()
             elif isinstance(item.get("album"), str):
                 album_name = item.get("album", "").strip().lower()
-            if kw_clean not in t and kw_clean not in a and kw_clean not in album_name:
-                return False
+
+            p1, p2 = parse_search_intent(kw)
+            if p1 and p2:
+                p1_l, p2_l = p1.lower(), p2.lower()
+                matched = (
+                    (p1_l in t or p1_l in a or p1_l in album_name) or
+                    (p2_l in t or p2_l in a or p2_l in album_name)
+                )
+                if not matched:
+                    return False
+            else:
+                if kw_clean not in t and kw_clean not in a and kw_clean not in album_name:
+                    return False
 
         # 校验本地物理文件是否存在
         spec = item.get("audioSpec") or {}
@@ -1991,7 +2178,7 @@ async def search_track(request: Request):
     return JSONResponse(content=merged, status_code=upstream_resp.status_code, headers=resp_headers)
 
 
-async def fetch_netease_api_search(keyword: str, limit: int = 30) -> list[dict]:
+async def fetch_netease_api_search(keyword: str, limit: int = 40) -> list[dict]:
     if not keyword:
         return []
     try:
@@ -2004,6 +2191,7 @@ async def fetch_netease_api_search(keyword: str, limit: int = 30) -> list[dict]:
             sid = str(s.get("id"))
             items.append({
                 "id": f"netease:{sid}",
+                "guid": f"online:netease:{sid}",
                 "source": "netease",
                 "title": s.get("name") or "",
                 "artist": s.get("artist") or "",
@@ -2014,11 +2202,54 @@ async def fetch_netease_api_search(keyword: str, limit: int = 30) -> list[dict]:
                 "file_size": 31457280,
                 "cover_url": s.get("pic_url") or "",
                 "has_stream": True,
-                "download_url": "",
             })
         return items
     except Exception as e:
         logger.warning("fetch_netease_api_search failed: %s", e)
+        return []
+
+
+async def fetch_kuwo_api_search(keyword: str, limit: int = 40) -> list[dict]:
+    """酷我音乐开放搜索接口并发检索，丰富原唱、专辑与多版本曲目。"""
+    if not keyword:
+        return []
+    try:
+        from urllib.parse import quote
+        url = f"http://search.kuwo.cn/r.s?client=kt&all={quote(keyword)}&pn=0&rn={limit}&vipver=1&ft=music&encoding=utf8&rformat=json&mobi=1"
+        async with httpx.AsyncClient(timeout=4.5, follow_redirects=True) as client:
+            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200:
+                return []
+            data = json.loads(r.text)
+            abslist = data.get("abslist") or []
+            items = []
+            for it in abslist:
+                rid = str(it.get("MUSICRID") or "")
+                if rid.startswith("MUSIC_"):
+                    rid = rid[6:]
+                if not rid:
+                    continue
+                name = str(it.get("SONGNAME") or "").strip()
+                artist = str(it.get("ARTIST") or "").strip().replace("&", " / ")
+                album = str(it.get("ALBUM") or "").strip()
+                dur_s = float(it.get("DURATION") or 240)
+                items.append({
+                    "id": f"lx:kw:{rid}",
+                    "guid": f"online:lx:kw:{rid}",
+                    "source": "lx",
+                    "title": name,
+                    "artist": artist,
+                    "album": album,
+                    "duration_s": dur_s,
+                    "ext": "flac",
+                    "quality": "FLAC",
+                    "file_size": 31457280,
+                    "cover_url": f"/music/ext/api/static_cover?title={quote(name)}&artist={quote(artist)}",
+                    "has_stream": True,
+                })
+            return items
+    except Exception as e:
+        logger.warning("fetch_kuwo_api_search failed: %s", e)
         return []
 
 
@@ -2050,15 +2281,27 @@ async def fetch_native_suggest_search(keyword: str) -> list[dict]:
 
 async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None:
     sources = []
-    # 1. 优先加入内置原生联想与模糊匹配结果 (网易云 + 酷我并发直连)
-    sources.append(fetch_native_suggest_search(keyword))
-    # 2. 网易云音乐原生 API 搜索
+    p1, p2 = parse_search_intent(keyword)
+
+    # 1. 优先加入网易云与酷我开放接口深度并发搜索 (原唱、代表作、正规专辑全量覆盖)
+    sources.append(fetch_kuwo_api_search(keyword, limit=40))
     try:
         n_cfg = netease_api.load_netease_config()
-        if n_cfg.get("enabled", True) or n_cfg.get("cookie"):
-            sources.append(fetch_netease_api_search(keyword, int(CONF.get("netease_search_limit", 30))))
+        has_wy = n_cfg.get("enabled", True) or n_cfg.get("cookie")
+        if has_wy:
+            sources.append(fetch_netease_api_search(keyword, limit=40))
     except Exception:
-        pass
+        has_wy = False
+
+    # 2. 如果识别出单曲与作者 (类似网易云单曲搜索模式)，并发深入检索该作者所有音乐作品与单曲原唱
+    if p1 and p2:
+        for term in (p1, p2):
+            sources.append(fetch_kuwo_api_search(term, limit=40))
+            if has_wy:
+                sources.append(fetch_netease_api_search(term, limit=40))
+
+    # 3. 辅助补充联想与候选歌曲
+    sources.append(fetch_native_suggest_search(keyword))
     if CONF.get("netease_enabled", True):
         sources.append(fetch_musicbox_search(get_musicbox_client(request.app), keyword, CONF["netease_search_limit"]))
     if CONF.get("musicdl_enabled", True):
@@ -2355,6 +2598,38 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
 @app.api_route("/music/api/v1/track/stream/{subpath:path}", methods=["GET", "HEAD"])
 async def stream_track(request: Request):
     guid = extract_guid(request)
+    if is_download_guid(guid):
+        dl_id = download_id_from_guid(guid)
+        rec = None
+        if dl_id:
+            try:
+                import sqlite3
+                with sqlite3.connect(download_mgr.DB_PATH) as conn:
+                    conn.row_factory = sqlite3.Row
+                    cur = conn.cursor()
+                    cur.execute("SELECT * FROM download_records WHERE id = ?", (dl_id,))
+                    row = cur.fetchone()
+                    if row:
+                        rec = dict(row)
+            except Exception as e_rec:
+                logger.warning("fetch download record %s error: %s", dl_id, e_rec)
+        if rec and rec.get("file_path") and os.path.exists(rec["file_path"]):
+            fp = rec["file_path"]
+            ext = rec.get("ext") or os.path.splitext(fp)[1].lstrip(".") or "flac"
+            file_size = os.path.getsize(fp)
+            if request.method == "HEAD":
+                resp_headers = {
+                    "Content-Type": media_type_for_ext(ext),
+                    "Content-Length": str(file_size),
+                    "Accept-Ranges": "bytes",
+                    "Cache-Control": "public, max-age=3600",
+                    "Access-Control-Allow-Origin": "*",
+                }
+                return Response(status_code=200, headers=resp_headers)
+            range_header = request.headers.get("range")
+            return serve_file_with_range(fp, range_header, media_type_for_ext(ext))
+        return JSONResponse(content={"code": -1, "msg": "下载文件不存在或已被删除"}, status_code=404)
+
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
     range_header = request.headers.get("range")
@@ -2643,7 +2918,27 @@ async def _fetch_online_info(request: Request, guid: str) -> dict | None:
 @app.get("/music/api/v1/lyric/list")
 @app.get("/music/api/v1/lyric/list/{subpath:path}")
 async def lyric_list(request: Request, subpath: str = ""):
-    guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
+    guid = extract_guid(request, subpath if (is_online_guid(subpath) or is_download_guid(subpath)) else None)
+    if is_download_guid(guid):
+        dl_id = download_id_from_guid(guid)
+        lrc_text = ""
+        if dl_id:
+            try:
+                import sqlite3
+                with sqlite3.connect(download_mgr.DB_PATH) as conn:
+                    conn.row_factory = sqlite3.Row
+                    cur = conn.cursor()
+                    cur.execute("SELECT file_path FROM download_records WHERE id = ?", (dl_id,))
+                    row = cur.fetchone()
+                    if row and row["file_path"]:
+                        lrc_p = os.path.splitext(row["file_path"])[0] + ".lrc"
+                        if os.path.exists(lrc_p):
+                            with open(lrc_p, "r", encoding="utf-8") as lf:
+                                lrc_text = lf.read()
+            except Exception:
+                pass
+        return JSONResponse(content=build_lyric_list_payload(guid, lrc_text))
+
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
@@ -2707,8 +3002,56 @@ def _find_track_title_artist_from_cache(guid: str) -> tuple[str, str]:
 @app.get("/music/api/v1/track/metadata/{subpath:path}")
 @app.get("/music/api/v1/track/audio-info")
 async def track_metadata(request: Request, subpath: str = ""):
-    guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
+    guid = extract_guid(request, subpath if (is_online_guid(subpath) or is_download_guid(subpath)) else None)
     logger.info(">>> [TRACK_METADATA_CALLED] guid=%s path=%s query=%s", guid, request.url.path, request.url.query)
+    if is_download_guid(guid):
+        dl_id = download_id_from_guid(guid)
+        rec = None
+        if dl_id:
+            try:
+                import sqlite3
+                with sqlite3.connect(download_mgr.DB_PATH) as conn:
+                    conn.row_factory = sqlite3.Row
+                    cur = conn.cursor()
+                    cur.execute("SELECT * FROM download_records WHERE id = ?", (dl_id,))
+                    row = cur.fetchone()
+                    if row:
+                        rec = dict(row)
+            except Exception:
+                pass
+        title = (rec.get("title") or "下载音乐") if rec else "下载音乐"
+        artist = (rec.get("artist") or "未知歌手") if rec else "未知歌手"
+        ext = (rec.get("ext") or "flac") if rec else "flac"
+        file_path = (rec.get("file_path") or "") if rec else ""
+        file_size = int((rec.get("size_mb") or 0) * 1024 * 1024) if rec else 0
+        if file_path and os.path.exists(file_path):
+            file_size = os.path.getsize(file_path)
+
+        lyric_text = ""
+        if file_path:
+            lrc_p = os.path.splitext(file_path)[0] + ".lrc"
+            if os.path.exists(lrc_p):
+                try:
+                    with open(lrc_p, "r", encoding="utf-8") as lf:
+                        lyric_text = lf.read()
+                except Exception:
+                    pass
+
+        data = {
+            "id": guid,
+            "title": title,
+            "artist": artist,
+            "album": rec.get("album") or "下载歌曲",
+            "duration_s": 200,
+            "coverId": guid,
+            "cover_url": f"/music/api/v1/static/cover?coverId={guid}",
+            "ext": ext,
+            "file_size": file_size,
+            "path": file_path,
+            "lyric": lyric_text,
+        }
+        return JSONResponse(content=build_metadata_payload(guid, data))
+
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
@@ -2765,9 +3108,42 @@ async def track_metadata(request: Request, subpath: str = ""):
 @app.api_route("/music/api/v1/static/cover", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/static/cover/{subpath:path}", methods=["GET", "HEAD"])
 async def static_cover(request: Request, subpath: str = ""):
-    guid = extract_guid(request, subpath if is_online_guid(subpath) else None)
-    if not guid and subpath.startswith("online:"):
+    guid = extract_guid(request, subpath if (is_online_guid(subpath) or is_download_guid(subpath)) else None)
+    if not guid and (subpath.startswith("online:") or subpath.startswith("download:")):
         guid = subpath
+
+    if is_download_guid(guid):
+        dl_id = download_id_from_guid(guid)
+        if dl_id:
+            try:
+                import sqlite3
+                with sqlite3.connect(download_mgr.DB_PATH) as conn:
+                    conn.row_factory = sqlite3.Row
+                    cur = conn.cursor()
+                    cur.execute("SELECT file_path, guid FROM download_records WHERE id = ?", (dl_id,))
+                    row = cur.fetchone()
+                    if row:
+                        fp = row["file_path"]
+                        if fp and os.path.exists(fp):
+                            try:
+                                import mutagen
+                                if fp.lower().endswith(".flac"):
+                                    from mutagen.flac import FLAC
+                                    audio = FLAC(fp)
+                                    if audio.pictures:
+                                        pic = audio.pictures[0]
+                                        return Response(content=pic.data, media_type=pic.mime or "image/jpeg")
+                                else:
+                                    audio = mutagen.File(fp)
+                                    for k in audio.keys():
+                                        if k.startswith("APIC"):
+                                            return Response(content=audio[k].data, media_type=audio[k].mime or "image/jpeg")
+                            except Exception:
+                                pass
+                        if row["guid"] and is_online_guid(row["guid"]):
+                            guid = row["guid"]
+            except Exception:
+                pass
 
     # 优雅音乐艺术高清封面备选池
     cur_time_bucket = int(time.time() // 1800)
@@ -3795,6 +4171,8 @@ async def playlist_track_list(request: Request):
                 "createdAt": 1700000000,
                 "updatedAt": 1700000000,
                 "isCue": False,
+                "accessStatus": 0,
+                "isUnavailable": False,
                 "audioSpec": {
                     "extension": r.get("ext") or "flac",
                     "format": (r.get("ext") or "flac").upper(),

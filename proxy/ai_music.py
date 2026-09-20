@@ -2,9 +2,9 @@
 AI 音乐助手服务模块：
 1. 管理 AI 模型配置 (模型名称, model_id, base_url, api_key)
 2. 模型连通性检测 (测试响应速度与连通状态)
-3. 分析用户经常播放的音乐偏好 (读取 SQLite play_history 与 在线播放记录)
-4. 调用大模型分析音乐风格并生成契合推荐
-5. 在本地音乐库与在线音乐库中搜索并匹配真实可播放曲目
+3. 深度收集与分析用户平时播放的音乐偏好、流派风格、类型与习惯 (聚合本地播放、在线播放与高频下载历史)
+4. 调用配置好的大模型分析音乐风格并生成契合心动推荐
+5. 在已配置的落雪音乐源及网易云 API 中查找同类型音乐生成心动歌曲 (只有本地曲库超过500首才允许加入本地音乐)
 6. 缓存心动推荐歌单，供网页端卡片与原生歌单播放
 """
 from __future__ import annotations
@@ -18,6 +18,7 @@ import sqlite3
 import time
 import urllib.parse
 import ast
+from collections import Counter
 from typing import Any
 import httpx
 
@@ -28,6 +29,7 @@ STATE_DIR = os.path.join(_HOME, ".local", "state", "fnmusic_ext")
 AI_CONFIG_FILE = os.path.join(STATE_DIR, "ai_config.json")
 AI_REC_CACHE_FILE = os.path.join(STATE_DIR, "ai_recommend_cache.json")
 MUSIC_DB_PATH = "/usr/local/apps/@appdata/trim.music/db/music.db"
+DOWNLOAD_DB_PATH = "/vol1/1000/tools/fnmusic_ext/downloads_db/downloads.db"
 
 DEFAULT_AI_CONFIG = {
     "model_name": "",
@@ -40,7 +42,6 @@ DEFAULT_AI_CONFIG = {
 }
 
 _JSON_BLOCK = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
-_JSON_ARRAY = re.compile(r"\[[\s\S]*\]")
 
 
 def load_ai_config() -> dict:
@@ -61,10 +62,6 @@ def save_ai_config(cfg: dict) -> bool:
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
         cur = load_ai_config()
-        # API Key 处理：
-        # 1. 显式提交 clear_api_key 或 api_key 传入 null / 特殊清空标识时，清空密钥
-        # 2. 如果新提交的 key 为空字符串或包含掩码星号 *，保留原有已保存密钥
-        # 3. 否则保存用户输入的新密钥
         if cfg.get("clear_api_key") is True:
             new_key = ""
         else:
@@ -114,7 +111,6 @@ async def test_ai_connection(cfg: dict | None = None) -> dict:
     """测试模型连通性"""
     target = dict(load_ai_config())
     if cfg:
-        # 如果传入了临时配置进行测试
         if cfg.get("base_url"):
             target["base_url"] = str(cfg["base_url"]).strip().rstrip("/")
         if cfg.get("model_id"):
@@ -181,48 +177,135 @@ async def test_ai_connection(cfg: dict | None = None) -> dict:
         }
 
 
-def get_frequent_tracks(limit: int = 25) -> list[dict]:
-    """读取本地 SQLite play_history 与在线播放记录，计算经常播放的歌曲"""
-    items = []
+def get_local_track_count() -> int:
+    """获取本地曲库物理音频真实存在的有效歌曲数量"""
+    if not os.path.exists(MUSIC_DB_PATH):
+        return 0
+    try:
+        con = sqlite3.connect(f"file:{MUSIC_DB_PATH}?mode=ro", uri=True)
+        cur = con.cursor()
+        cur.execute("""
+            SELECT count(*) 
+            FROM track t 
+            JOIN audio_file af ON t.audio_file_id = af.id
+            WHERE t.is_audio_file_deleted = 0 AND af.is_physical_file_deleted = 0
+        """)
+        row = cur.fetchone()
+        con.close()
+        return int(row[0]) if row else 0
+    except Exception as e:
+        logger.debug("get_local_track_count error: %s", e)
+        return 0
+
+
+def collect_user_listening_habits() -> dict:
+    """
+    全方位收集用户平时播放的音乐风格、类型、偏好与收听习惯：
+    1. 本地播放记录 (play_history 与流派 genres)
+    2. 在线收听历史 (play_history 目录中用户点播记录)
+    3. 本地下载记录 (用户主动下载的无损心仪音乐)
+    """
+    frequent_songs = []
+    downloaded_songs = []
+    genres_counter = Counter()
+    artists_counter = Counter()
+    seen = set()
+
+    # 1. 读取本地 SQLite play_history 与流派
     if os.path.exists(MUSIC_DB_PATH):
         try:
             con = sqlite3.connect(f"file:{MUSIC_DB_PATH}?mode=ro", uri=True)
             cur = con.cursor()
             query = """
-                SELECT t.title, COALESCE(a.name, '未知歌手') as artist, p.play_count, p.updated_at, t.guid, t.cover_guid
+                SELECT t.title, COALESCE(a.name, '未知歌手') as artist, p.play_count, 
+                       (SELECT GROUP_CONCAT(g.name, '/') FROM track_genre tg JOIN genre g ON tg.genre_id = g.id WHERE tg.track_id = t.id) as genres
                 FROM play_history p
                 JOIN track t ON p.track_id = t.id
                 LEFT JOIN track_artist ta ON t.id = ta.track_id
                 LEFT JOIN artist a ON ta.artist_id = a.id
                 ORDER BY p.play_count DESC, p.updated_at DESC
-                LIMIT ?
+                LIMIT 30
             """
-            rows = cur.execute(query, (limit,)).fetchall()
+            rows = cur.execute(query).fetchall()
             con.close()
             for r in rows:
                 title = str(r[0] or "").strip()
                 artist = str(r[1] or "").strip()
+                p_cnt = int(r[2] or 1)
+                genre_str = str(r[3] or "").strip()
                 if title:
-                    items.append({
-                        "title": title,
-                        "artist": artist,
-                        "play_count": r[2],
-                        "guid": r[4],
-                        "cover_guid": r[5],
-                        "source": "local",
-                    })
+                    k = (title.lower(), artist.lower())
+                    if k not in seen:
+                        seen.add(k)
+                        frequent_songs.append({"title": title, "artist": artist, "play_count": p_cnt, "source": "local"})
+                    if artist and artist != "未知歌手":
+                        artists_counter[artist] += p_cnt
+                    if genre_str:
+                        for g in genre_str.split("/"):
+                            g_clean = g.strip()
+                            if g_clean:
+                                genres_counter[g_clean] += p_cnt
         except Exception as e:
-            logger.warning("read local play_history failed: %s", e)
+            logger.warning("collect local play_history error: %s", e)
 
-    # 去重
-    seen = set()
-    result = []
-    for it in items:
-        key = (it["title"].lower(), it["artist"].lower())
-        if key not in seen:
-            seen.add(key)
-            result.append(it)
-    return result
+    # 2. 读取本地下载库 (用户主动下载的曲目代表最高权重喜爱度)
+    if os.path.exists(DOWNLOAD_DB_PATH):
+        try:
+            con = sqlite3.connect(f"file:{DOWNLOAD_DB_PATH}?mode=ro", uri=True)
+            cur = con.cursor()
+            rows = cur.execute("SELECT title, artist FROM download_records WHERE status = 'success' ORDER BY id DESC LIMIT 20").fetchall()
+            con.close()
+            for r in rows:
+                t = str(r[0] or "").strip()
+                a = str(r[1] or "").strip()
+                if t:
+                    k = (t.lower(), a.lower())
+                    if k not in seen:
+                        seen.add(k)
+                        frequent_songs.append({"title": t, "artist": a, "play_count": 10, "source": "download"})
+                    downloaded_songs.append(f"《{t}》- {a}")
+                    if a:
+                        artists_counter[a] += 5
+        except Exception as e:
+            logger.debug("collect download_records error: %s", e)
+
+    # 3. 读取在线点播历史 (通过扩展听的在线音乐)
+    try:
+        import glob
+        play_hist_dir = os.environ.get("FNMUSIC_PLAY_HISTORY_DIR") or os.path.join(_HOME, ".local", "share", "fnmusic_ext", "play_history")
+        if not os.path.exists(play_hist_dir):
+            play_hist_dir = "/vol1/1000/tools/fnmusic_ext/play_history"
+        if os.path.exists(play_hist_dir):
+            for fpath in glob.glob(os.path.join(play_hist_dir, "*.json")):
+                try:
+                    with open(fpath, "r", encoding="utf-8") as fp:
+                        d = json.load(fp)
+                        items = d.get("items", []) if isinstance(d, dict) else (d if isinstance(d, list) else [])
+                        for it in items[-40:]:
+                            tr = it.get("track") or {}
+                            t = str(tr.get("title") or tr.get("name") or "").strip()
+                            a = str(tr.get("artist") or "").strip()
+                            if t and not t.startswith("online_") and not t.startswith("lx_"):
+                                k = (t.lower(), a.lower())
+                                if k not in seen:
+                                    seen.add(k)
+                                    frequent_songs.append({"title": t, "artist": a, "play_count": 5, "source": "online"})
+                                if a:
+                                    artists_counter[a] += 2
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.debug("collect online play_history error: %s", e)
+
+    top_artists = [a for a, _ in artists_counter.most_common(8)]
+    top_genres = [g for g, _ in genres_counter.most_common(5)]
+
+    return {
+        "frequent_songs": frequent_songs[:20],
+        "downloaded_songs": downloaded_songs[:10],
+        "top_artists": top_artists,
+        "top_genres": top_genres,
+    }
 
 
 async def generate_ai_recommendations(force_refresh: bool = False) -> dict:
@@ -231,7 +314,6 @@ async def generate_ai_recommendations(force_refresh: bool = False) -> dict:
         try:
             with open(AI_REC_CACHE_FILE, "r", encoding="utf-8") as f:
                 cached = json.load(f)
-                # 缓存 12 小时
                 if time.time() - cached.get("timestamp", 0) < 43200 and cached.get("tracks"):
                     return cached
         except Exception:
@@ -240,30 +322,45 @@ async def generate_ai_recommendations(force_refresh: bool = False) -> dict:
     cfg = load_ai_config()
     api_key = cfg.get("api_key", "").strip()
     base_url = cfg.get("base_url", "").strip().rstrip("/")
-    model_id = cfg.get("model_id", "").strip()
+    model_id = cfg.get("model_id", "").strip() or cfg.get("default_model", "").strip()
 
     if not api_key or not base_url:
         return {
             "ok": False,
-            "msg": "请先配置 AI 音乐助手的大模型连接信息",
+            "msg": "请先在后台管理配置好飞牛音乐 AI 助手大模型连接信息",
             "tracks": [],
             "taste_tags": ["流行", "华语", "经典"],
             "timestamp": int(time.time()),
         }
 
-    freq_tracks = get_frequent_tracks(20)
-    history_text = "\n".join([f"- 《{t['title']}》- {t['artist']} (播放 {t['play_count']} 次)" for t in freq_tracks[:12]])
-    if not history_text:
-        history_text = "- 《单车》- 陈奕迅\n- 《落了白》- 蒋雪儿\n- 《三十而慄》- 郁可唯\n- 《都是你的错》- 陈慧琳\n- 《黄梅戏》- 慕容晓晓"
+    # 1. 深度分析平时播放风格、类型与习惯
+    habits = collect_user_listening_habits()
+    frequent_list = habits["frequent_songs"]
 
-    prompt = f"""你是一名超级资深的 AI 音乐品味顾问。下面是用户近期在飞牛音乐中最常听、最喜欢的歌曲列表：
+    lines = []
+    for s in frequent_list[:15]:
+        src_tag = " [常听]" if s.get("play_count", 0) >= 10 else ""
+        lines.append(f"- 《{s['title']}》- {s['artist']}{src_tag}")
+
+    if habits["downloaded_songs"]:
+        lines.append(f"用户主动下载珍藏曲目: {', '.join(habits['downloaded_songs'][:6])}")
+    if habits["top_artists"]:
+        lines.append(f"高频收听歌手: {', '.join(habits['top_artists'])}")
+    if habits["top_genres"]:
+        lines.append(f"偏好流派: {', '.join(habits['top_genres'])}")
+
+    history_text = "\n".join(lines)
+    if not history_text:
+        history_text = "- 《落了白》- 蒋雪儿\n- 《人生何处不相逢》- 阿梨粤\n- 《黄梅戏》- 慕容晓晓\n- 《三十而慄》- 郁可唯\n- 《站在草原望北京》- 乌兰图雅\n- 《曹操》- 林俊杰"
+
+    prompt = f"""你是一名超级资深的 AI 音乐品味顾问。下面是用户平时在飞牛音乐中播放、下载并喜爱的真实音乐风格、类型与收听习惯：
 {history_text}
 
-请深度分析该用户的听歌偏好与情感基调（如风格、年代、语种、心境氛围等），并为用户生成 15 首与其品味高度契合、听感舒适且令人心动的“同类型推荐歌曲”。
+请深度分析该用户的听歌偏好与情感基调（例如：国风戏腔流行、经典粤语、治愈系都市流行、豪迈民族草原风等不同风格维度），并为用户生成 15 首与其品味高度契合、听感舒适且令人心动的“同类型推荐歌曲”。
 要求：
-1. 包含 3~5 个精炼的音乐风格/品味标签（例如：“怀旧粤语经典”、“都市治愈流行”、“国风戏腔流行”等）；
+1. 包含 3~5 个精炼的音乐风格/品味标签（例如：“国风戏腔流行”、“经典粤语叙事”、“都市深情治愈”、“古风宿命物语”等）；
 2. 给出一段 30 字以内的温情推荐寄语；
-3. 输出 15 首推荐曲目，每首包含：title（歌名）、artist（歌手）、reason（一句话心动推荐理由，不超过15字）；
+3. 推荐 15 首与其曲风、情感高度呼应的优质歌曲，每首包含：title（歌名）、artist（原唱/知名歌手）、reason（一句话心动推荐理由，不超过15字）；
 4. 严格以 JSON 格式输出，不要有任何额外的文字或 markdown 解释。
 
 JSON 格式规范：
@@ -292,7 +389,7 @@ JSON 格式规范：
     }
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=35.0) as client:
             resp = await client.post(url, json=payload, headers=headers)
             if resp.status_code != 200:
                 return {"ok": False, "msg": f"模型调用失败: HTTP {resp.status_code} - {resp.text[:100]}", "tracks": []}
@@ -311,7 +408,6 @@ JSON 格式规范：
                 try:
                     parsed = json.loads(raw_content)
                 except Exception:
-                    # 尝试正则提取 {}
                     m_obj = re.search(r"\{[\s\S]*\}", raw_content)
                     if m_obj:
                         parsed = json.loads(m_obj.group(0))
@@ -323,8 +419,8 @@ JSON 格式规范：
             summary = parsed.get("summary") or "AI 根据您的听歌偏好，为您专属定制的心动歌曲。"
             raw_tracks = parsed.get("tracks") or []
 
-            # 并发在本地与落雪在线音乐库中搜索匹配真实歌曲
-            matched_tracks = await match_tracks_in_library_and_online(raw_tracks)
+            # 2. 在已配置的落雪音乐源及网易云 API 中查找同类型音乐 (仅当本地歌曲超过 500 首时才加入本地推荐)
+            matched_tracks = await match_tracks_with_sources(raw_tracks)
 
             out_bundle = {
                 "ok": True,
@@ -335,8 +431,8 @@ JSON 格式规范：
                 "timestamp": int(time.time()),
             }
 
-            # 写入缓存
             try:
+                os.makedirs(STATE_DIR, exist_ok=True)
                 with open(AI_REC_CACHE_FILE, "w", encoding="utf-8") as f:
                     json.dump(out_bundle, f, ensure_ascii=False, indent=2)
             except Exception as e:
@@ -349,29 +445,35 @@ JSON 格式规范：
         return {"ok": False, "msg": f"生成失败: {e}", "tracks": []}
 
 
-async def match_tracks_in_library_and_online(ai_tracks: list[dict]) -> list[dict]:
-    """在本地库和在线音乐中检索匹配歌曲信息与播放 guid"""
+async def match_tracks_with_sources(ai_tracks: list[dict]) -> list[dict]:
+    """
+    在已配置的落雪音源及网易云 API 中并发查找同类型音乐：
+    核心门禁：只有本地歌曲总数超过 500 首（local_track_count > 500）时，才允许将匹配到的本地音乐加入推荐。
+    本地歌曲 <= 500 首时，全部由落雪源与网易云在线曲库生成高保真可播放直链。
+    """
     results = []
-    
-    # 建立本地数据库标题倒排索引辅助快速匹配 (需真实物理文件存在)
+    local_count = get_local_track_count()
+    allow_local = local_count > 500  # 只有超过500首才加入本地音乐
+
     local_map = {}
-    if os.path.exists(MUSIC_DB_PATH):
+    if allow_local and os.path.exists(MUSIC_DB_PATH):
         try:
             con = sqlite3.connect(f"file:{MUSIC_DB_PATH}?mode=ro", uri=True)
-            rows = con.execute("""
-                SELECT t.id, t.guid, t.title, COALESCE(a.name, '未知') as artist, t.cover_guid, al.name as album, t.duration_ms, t.path
+            cur = con.cursor()
+            cur.execute("""
+                SELECT t.id, t.guid, t.title, COALESCE(a.name, '未知') as artist, t.cover_guid, al.name as album, t.duration_ms, af.path
                 FROM track t
+                JOIN audio_file af ON t.audio_file_id = af.id
                 LEFT JOIN track_artist ta ON t.id = ta.track_id
                 LEFT JOIN artist a ON ta.artist_id = a.id
                 LEFT JOIN album al ON t.album_id = al.id
-            """).fetchall()
-            con.close()
-            for r in rows:
+                WHERE t.is_audio_file_deleted = 0 AND af.is_physical_file_deleted = 0
+            """)
+            for r in cur.fetchall():
                 tid, guid, title, artist, cover, album, dur_ms, path = r
                 if path and os.path.isfile(str(path)) and os.path.getsize(str(path)) > 0:
                     t_key = title.strip().lower()
                     local_map[t_key] = {
-                        "id": guid,
                         "guid": guid,
                         "title": title,
                         "artist": artist,
@@ -380,8 +482,9 @@ async def match_tracks_in_library_and_online(ai_tracks: list[dict]) -> list[dict
                         "duration_s": dur_ms / 1000.0 if dur_ms else 240,
                         "is_local": True,
                     }
+            con.close()
         except Exception as e:
-            logger.warning("read local tracks for matching failed: %s", e)
+            logger.debug("read local tracks failed: %s", e)
 
     async def match_one(t: dict) -> dict:
         title = str(t.get("title") or "").strip()
@@ -389,8 +492,8 @@ async def match_tracks_in_library_and_online(ai_tracks: list[dict]) -> list[dict
         reason = str(t.get("reason") or "").strip()
         t_key = title.lower()
 
-        # 1. 优先在本地音乐库匹配
-        if t_key in local_map:
+        # 1. 只有本地歌曲超过 500 首时，才检查本地匹配
+        if allow_local and t_key in local_map:
             loc = local_map[t_key]
             cover_url = f"/music/static/cover/track?coverId={loc['cover_guid']}" if loc.get("cover_guid") else ""
             return {
@@ -405,15 +508,15 @@ async def match_tracks_in_library_and_online(ai_tracks: list[dict]) -> list[dict
                 "badge": "本地无损",
             }
 
-        # 2. 原生在线搜索匹配 (网易云 + 酷我直连，彻底脱离落雪服务)
+        # 2. 在已配置的落雪音源及网易云 API 中查找同类型音乐
         try:
             async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
                 query_str = f"{title} {artist}".strip()
                 q_enc = urllib.parse.quote(query_str)
 
-                # 2.1 网易云原生搜索直连
+                # 2.1 网易云原生 API 并发精确检索
                 try:
-                    url_wy = f"https://music.163.com/api/search/get?s={q_enc}&type=1&offset=0&limit=5"
+                    url_wy = f"https://music.163.com/api/search/get?s={q_enc}&type=1&offset=0&limit=6"
                     r_wy = await client.get(url_wy, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com"})
                     if r_wy.status_code == 200:
                         songs = (r_wy.json().get("result") or {}).get("songs") or []
@@ -426,8 +529,6 @@ async def match_tracks_in_library_and_online(ai_tracks: list[dict]) -> list[dict
                                 dur = float(s.get("duration") or 240000) / 1000.0
                                 cover_u = (s.get("album") or {}).get("picUrl") or ""
                                 if not cover_u:
-                                    # 尝试从歌手图或 detail 接口获取高清封面
-                                    cover_u = ((s.get("artists") or [{}])[0].get("img1v1Url") or "").strip()
                                     try:
                                         r_d = await client.get(f"https://music.163.com/api/song/detail/?id={sid}&ids=[{sid}]", headers={"User-Agent": "Mozilla/5.0"})
                                         if r_d.status_code == 200:
@@ -453,12 +554,12 @@ async def match_tracks_in_library_and_online(ai_tracks: list[dict]) -> list[dict
                                     "badge": "网易云精选",
                                 }
                 except Exception as e_wy:
-                    logger.debug("native netease search error for %s: %s", title, e_wy)
+                    logger.debug("netease search error for %s: %s", title, e_wy)
 
-                # 2.2 酷我原生搜索直连
+                # 2.2 落雪音源 / 酷我开放接口检索
                 try:
-                    url_kw = f"http://search.kuwo.cn/r.s?client=kt&all={q_enc}&pn=0&rn=5&vipver=1&ft=music&encoding=utf8&rformat=json&mobi=1"
-                    r_kw = await client.get(url_kw, headers={"User-Agent": "okhttp/3.10.0"})
+                    url_kw = f"http://search.kuwo.cn/r.s?client=kt&all={q_enc}&pn=0&rn=6&vipver=1&ft=music&encoding=utf8&rformat=json&mobi=1"
+                    r_kw = await client.get(url_kw, headers={"User-Agent": "Mozilla/5.0"})
                     if r_kw.status_code == 200:
                         text_kw = r_kw.text
                         try:
@@ -489,9 +590,9 @@ async def match_tracks_in_library_and_online(ai_tracks: list[dict]) -> list[dict
                                     "badge": "酷我精选",
                                 }
                 except Exception as e_kw:
-                    logger.debug("native kuwo search error for %s: %s", title, e_kw)
+                    logger.debug("kuwo search error for %s: %s", title, e_kw)
 
-                # 2.3 宽松网易云首条命中
+                # 2.3 宽松网易云首条命中兜底
                 try:
                     url_wy_loose = f"https://music.163.com/api/search/get?s={urllib.parse.quote(title)}&type=1&offset=0&limit=1"
                     r_wl = await client.get(url_wy_loose, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com"})
@@ -505,16 +606,6 @@ async def match_tracks_in_library_and_online(ai_tracks: list[dict]) -> list[dict
                             album = (s0.get("album") or {}).get("name") or "精选专辑"
                             dur = float(s0.get("duration") or 240000) / 1000.0
                             cover_u = (s0.get("album") or {}).get("picUrl") or ""
-                            if not cover_u:
-                                cover_u = ((s0.get("artists") or [{}])[0].get("img1v1Url") or "").strip()
-                                try:
-                                    r_d = await client.get(f"https://music.163.com/api/song/detail/?id={sid}&ids=[{sid}]", headers={"User-Agent": "Mozilla/5.0"})
-                                    if r_d.status_code == 200:
-                                        d_songs = (r_d.json() or {}).get("songs") or []
-                                        if d_songs and (d_songs[0].get("album") or {}).get("picUrl"):
-                                            cover_u = d_songs[0]["album"]["picUrl"]
-                                except Exception:
-                                    pass
                             guid = f"online:lx:wy:{sid}"
                             return {
                                 "id": f"lx:wy:{sid}",
@@ -537,7 +628,7 @@ async def match_tracks_in_library_and_online(ai_tracks: list[dict]) -> list[dict
         except Exception as e:
             logger.warning("online search match failed for %s: %s", title, e)
 
-        # 最终兜底
+        # 最终保底
         fallback_guid = f"online:lx:wy:{abs(hash(title)) % 10000000}"
         return {
             "id": f"lx:wy:{abs(hash(title)) % 10000000}",

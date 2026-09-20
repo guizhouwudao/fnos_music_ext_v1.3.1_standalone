@@ -84,7 +84,7 @@ fnos_music_ext/
 1. 将插件压缩包 `fnos_music_ext_v1.3.1_standalone.tar.gz` 上传或解压至目标 NAS（如 `/vol1/1000/beifen/fnos_plug/`）；
 2. 进入插件目录，执行一键安装脚本：
    ```bash
-   sudo bash install.sh-所在路径
+   sudo bash install.sh
    ```
 3. 脚本会自动完成以下操作：
    - 探测飞牛官方音乐服务目录；
@@ -114,7 +114,6 @@ fnos_music_ext/
 
 若需要完全恢复飞牛音乐官方出厂初始状态，只需在插件目录下执行：
 ```bash
-sudo bash uninstall.sh-所在路径
+sudo bash uninstall.sh
 ```
 脚本将自动停止扩展服务并恢复官方前端静态资源。
-如需恢复飞牛音乐原始状态，需要卸载飞牛音乐，选择清理残留数据然后重新安装 飞牛音乐 即可恢复原始状态

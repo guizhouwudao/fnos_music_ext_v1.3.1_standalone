@@ -33,8 +33,8 @@ def load_sources_meta() -> list[dict]:
         if fname.endswith(".js"):
             fpath = os.path.join(CUSTOM_SOURCES_DIR, fname)
             meta = parse_script_header(fpath)
-            # 默认启用前两个音源
-            meta["enabled"] = fname in ("全豆要.js", "波点音乐[bd].js")
+            # 默认不启用，完全由用户自主控制或导入
+            meta["enabled"] = False
             sources.append(meta)
     save_sources_meta(sources)
     return sources
@@ -87,9 +87,6 @@ async def resolve_music_url_native(song_info: dict, quality: str = "flac") -> Op
     """
     sources = load_sources_meta()
     enabled_sources = [s for s in sources if s.get("enabled")]
-    if not enabled_sources:
-        # 兜底：若未显式启用，默认自动启用全豆要与波点聚合音源
-        enabled_sources = [s for s in sources if s.get("id") in ("全豆要.js", "波点音乐[bd].js", "全豆要[聚合音源].js", "墨澜聚合音源.js")] or sources[:2]
 
     sid = str(song_info.get("songmid") or song_info.get("id") or "").strip()
     src = str(song_info.get("source") or "kw").strip()
@@ -152,8 +149,6 @@ async def resolve_music_pic_native(song_info: dict) -> Optional[str]:
     """通过本地已启用的自定义音源脚本解析封面大图 URL"""
     sources = load_sources_meta()
     enabled_sources = [s for s in sources if s.get("enabled")]
-    if not enabled_sources:
-        enabled_sources = [s for s in sources if s.get("id") in ("全豆要.js", "波点音乐[bd].js", "全豆要[聚合音源].js", "墨澜聚合音源.js")] or sources[:2]
 
     sid = str(song_info.get("songmid") or song_info.get("id") or "").strip()
     src = str(song_info.get("source") or "kw").strip()
@@ -203,8 +198,6 @@ async def resolve_music_lyric_native(song_info: dict) -> Optional[dict]:
     """通过本地已启用的自定义音源脚本解析同步 LRC 歌词"""
     sources = load_sources_meta()
     enabled_sources = [s for s in sources if s.get("enabled")]
-    if not enabled_sources:
-        enabled_sources = [s for s in sources if s.get("id") in ("全豆要.js", "波点音乐[bd].js", "全豆要[聚合音源].js", "墨澜聚合音源.js")] or sources[:2]
 
     sid = str(song_info.get("songmid") or song_info.get("id") or "").strip()
     src = str(song_info.get("source") or "kw").strip()
